@@ -5,6 +5,8 @@ import numpy as np
 import folium
 from streamlit_folium import st_folium
 from datetime import datetime, timedelta
+import os
+import json
 
 # --- 頁面設定 ---
 st.set_page_config(
@@ -13,69 +15,112 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- 資料庫設定與自動生成 ---
+DB_FILE = 'data.db'
+JSON_FILE = 'F-A0010-001.json'
+
+def setup_database():
+    """
+    檢查資料庫是否存在，如果不存在，則建立並從JSON檔案填充它。
+    """
+    if not os.path.exists(DB_FILE):
+        st.info("正在建立並初始化資料庫... 這只需要在首次啟動時執行。")
+        
+        # 1. 建立資料庫表格 (來自 create_db.py)
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS weather (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location TEXT,
+            min_temp REAL,
+            max_temp REAL,
+            description TEXT
+        )
+        ''')
+        conn.commit()
+        
+        # 2. 從 JSON 填充資料 (來自 process_data.py)
+        try:
+            with open(JSON_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            for location in data['cwaopendata']['resources']['resource']['data']['agrWeatherForecasts']['weatherForecasts']['location']:
+                location_name = location['locationName']
+                min_temp = float(location['weatherElements']['MinT']['daily'][0]['temperature'])
+                max_temp = float(location['weatherElements']['MaxT']['daily'][0]['temperature'])
+                description = location['weatherElements']['Wx']['daily'][0]['weather']
+
+                if location_name and min_temp is not None and max_temp is not None and description:
+                    cursor.execute('''
+                    INSERT INTO weather (location, min_temp, max_temp, description)
+                    VALUES (?, ?, ?, ?)
+                    ''', (location_name, min_temp, max_temp, description))
+            
+            conn.commit()
+            st.success("資料庫已成功建立並填充資料！")
+        except FileNotFoundError:
+            st.error(f"錯誤：找不到 '{JSON_FILE}'。請確保此檔案與 app.py 在同一個目錄下。")
+            return False
+        except Exception as e:
+            st.error(f"處理JSON或資料庫時發生錯誤：{e}")
+            return False
+        finally:
+            conn.close()
+    return True
+
 # --- 資料載入與處理 ---
 @st.cache_data
 def load_data():
     try:
-        conn = sqlite3.connect('data.db')
-        # 確保 process_data.py 已經執行過
-        try:
-            df = pd.read_sql_query("SELECT * FROM weather", conn)
-            if df.empty:
-                st.error("資料庫是空的，請先執行 `process_data.py` 來填充數據。")
-                return None, None
-        except pd.io.sql.DatabaseError:
-            st.error("找不到 'weather' 表格，請先執行 `create_db.py` 和 `process_data.py`。")
-            return None, None
-            
-        # 模擬經緯度數據 (因為原始資料沒有)
-        # 注意：這些是大概位置，不是精確座標
-        mock_coords = {
-            '北部地區': [25.033, 121.565], # 以臺北為代表
-            '中部地區': [24.148, 120.674], # 以臺中為代表
-            '南部地區': [22.999, 120.213], # 以臺南為代表
-            '東北部地區': [24.746, 121.745], # 以宜蘭為代表
-            '東部地區': [23.987, 121.604], # 以花蓮為代表
-            '東南部地區': [22.75, 121.15],  # 以臺東為代表
-            # 保留縣市以備未來擴充
-            '宜蘭縣': [24.746, 121.745], '桃園市': [24.993, 121.301], '新竹縣': [24.804, 121.011],
-            '苗栗縣': [24.560, 120.821], '彰化縣': [24.079, 120.544], '南投縣': [23.918, 120.982],
-            '雲林縣': [23.709, 120.431], '嘉義縣': [23.453, 120.576], '屏東縣': [22.549, 120.591],
-            '臺東縣': [22.992, 121.059], '花蓮縣': [23.987, 121.604], '澎湖縣': [23.571, 119.566],
-            '基隆市': [25.128, 121.742], '新竹市': [24.813, 120.968], '嘉義市': [23.479, 120.444],
-            '臺北市': [25.033, 121.565], '高雄市': [22.627, 120.301], '新北市': [25.017, 121.463],
-            '臺中市': [24.148, 120.674], '臺南市': [22.999, 120.213], '連江縣': [26.151, 119.954],
-            '金門縣': [24.437, 118.319]
-        }
-        df['coords'] = df['location'].map(mock_coords)
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query("SELECT * FROM weather", conn)
         
-        # 移除沒有對應座標的資料列，並重新賦值
+        if df.empty:
+            st.error("資料庫是空的。")
+            return None, []
+            
+        # 模擬經緯度數據
+        mock_coords = {
+            '北部地區': [25.033, 121.565], '中部地區': [24.148, 120.674],
+            '南部地區': [22.999, 120.213], '東北部地區': [24.746, 121.745],
+            '東部地區': [23.987, 121.604], '東南部地區': [22.75, 121.15]
+        }
+        
+        df['coords'] = df['location'].map(mock_coords)
         df = df.dropna(subset=['coords'])
 
-        # 如果過濾後為空，提前返回
         if df.empty:
-            st.warning("沒有任何地點資料有對應的座標，無法繼續。")
-            # 仍然返回一個帶有正確欄位的空dataframe，以防後續操作出錯
+            st.warning("資料庫中的地點無法對應到任何已知座標。")
             return pd.DataFrame(columns=['id', 'location', 'min_temp', 'max_temp', 'description', 'coords', 'lat', 'lon', 'date']), list(mock_coords.keys())
 
-        # 將座標拆分為 lat 和 lon，使用更安全的方式
         df = df.reset_index(drop=True)
         coords_df = pd.DataFrame(df['coords'].tolist(), columns=['lat', 'lon'])
         df = pd.concat([df, coords_df], axis=1)
         
-        # 模擬日期數據 (因為原始資料只有一天)
+        # 模擬日期數據
         today = datetime.now().date()
-        df['date'] = [today + timedelta(days=i % 3) for i in range(len(df))] # 模擬3天的數據
+        df['date'] = [today + timedelta(days=i % 3) for i in range(len(df))]
         
-        return df, list(mock_coords.keys())
+        return df, sorted(list(df['location'].unique()))
+    
+    except Exception as e:
+        st.error(f"讀取資料時發生錯誤：{e}")
+        return None, []
+    
     finally:
-        if 'conn' in locals() and conn:
+        if 'conn' in locals():
             conn.close()
+
+# --- 主程式流程 ---
+if not setup_database():
+    st.stop() # 如果資料庫設定失敗，則停止執行
 
 df, location_options = load_data()
 
 if df is not None:
-    st.success("已載入氣象資料！")
+    if not df.empty:
+        st.success("已載入氣象資料！")
     
     # --- 側邊欄 (Sidebar) ---
     with st.sidebar:
